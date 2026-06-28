@@ -1,12 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+
+	"github.com/youruser/gokeep/internal/crypto"
 	"github.com/youruser/gokeep/internal/session"
 	"github.com/youruser/gokeep/internal/vault"
 )
@@ -328,7 +334,7 @@ func TestRootCommandStructure(t *testing.T) {
 	for _, c := range subs {
 		names[c.Name()] = true
 	}
-	expected := []string{"init", "lock", "reset", "list", "project", "env", "secret", "status"}
+	expected := []string{"init", "lock", "reset", "list", "project", "env", "secret", "status", "find", "export", "import"}
 	for _, n := range expected {
 		if !names[n] {
 			t.Errorf("root missing subcommand: %s", n)
@@ -385,7 +391,7 @@ func TestSecretSubcommands(t *testing.T) {
 	for _, c := range subs {
 		names[c.Name()] = true
 	}
-	expected := []string{"add", "edit", "remove", "list", "reveal", "show"}
+	expected := []string{"add", "edit", "remove", "list", "reveal", "show", "move", "copy"}
 	for _, n := range expected {
 		if !names[n] {
 			t.Errorf("secret missing subcommand: %s", n)
@@ -413,6 +419,298 @@ func TestSecretAddFlags(t *testing.T) {
 		if secretAddCmd.Flags().Lookup(name) == nil {
 			t.Errorf("secret add missing flag: %s", name)
 		}
+	}
+}
+
+// --- secret move/copy tests ---
+
+// resetMoveCopyFlags resets cobra flag state for secret move/copy commands
+// and the parent secretCmd persistent flags. pflag.Set() marks Changed=true
+// permanently; this resets both the value and Changed so required flag checks
+// and scoped lookups work correctly across table-driven subtests.
+func resetMoveCopyFlags(t *testing.T) {
+	t.Helper()
+	resetFlag(t, secretCmd.PersistentFlags(), "project")
+	for _, name := range []string{"dest-project", "dest-env", "env"} {
+		resetFlag(t, secretMoveCmd.Flags(), name)
+	}
+	for _, name := range []string{"dest-project", "dest-env", "env", "name"} {
+		resetFlag(t, secretCopyCmd.Flags(), name)
+	}
+}
+
+func resetFlag(t *testing.T, fs *pflag.FlagSet, name string) {
+	t.Helper()
+	f := fs.Lookup(name)
+	if f == nil {
+		return
+	}
+	_ = f.Value.Set("")
+	f.Changed = false
+}
+
+func TestSecretMoveFlags(t *testing.T) {
+	if secretMoveCmd.Flags().Lookup("dest-project") == nil {
+		t.Error("secret move missing --dest-project flag")
+	}
+	if secretMoveCmd.Flags().Lookup("dest-env") == nil {
+		t.Error("secret move missing --dest-env flag")
+	}
+	if secretMoveCmd.Flags().Lookup("env") == nil {
+		t.Error("secret move missing --env flag")
+	}
+	if secretMoveCmd.Flags().Lookup("dest-project").Annotations[cobra.BashCompOneRequiredFlag] == nil {
+		t.Error("--dest-project should be required")
+	}
+}
+
+func TestSecretCopyFlags(t *testing.T) {
+	if secretCopyCmd.Flags().Lookup("dest-project") == nil {
+		t.Error("secret copy missing --dest-project flag")
+	}
+	if secretCopyCmd.Flags().Lookup("dest-env") == nil {
+		t.Error("secret copy missing --dest-env flag")
+	}
+	if secretCopyCmd.Flags().Lookup("env") == nil {
+		t.Error("secret copy missing --env flag")
+	}
+	if secretCopyCmd.Flags().Lookup("name") == nil {
+		t.Error("secret copy missing --name flag")
+	}
+	if secretCopyCmd.Flags().Lookup("dest-project").Annotations[cobra.BashCompOneRequiredFlag] == nil {
+		t.Error("--dest-project should be required")
+	}
+}
+
+func TestSecretMove(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pSrcUID, _ := v.AddProject(vault.Project{Name: "src"})
+	pDstUID, _ := v.AddProject(vault.Project{Name: "dst"})
+	v.AddSecret(vault.Secret{Name: "MY_SECRET", Value: "s3cret", ProjectUID: pSrcUID, URL: "https://example.com", Notes: "test"})
+	v.AddSecret(vault.Secret{Name: "DUP_SECRET", Value: "dup", ProjectUID: pSrcUID})
+	v.AddSecret(vault.Secret{Name: "DUP_SECRET", Value: "dup", ProjectUID: pDstUID})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	vaultFile := filepath.Join(dir, vault.FileName)
+	origVaultBytes, err := os.ReadFile(vaultFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	t.Cleanup(func() {
+		rootCmd.SetArgs(nil)
+		resetMoveCopyFlags(t)
+	})
+
+	tests := []struct {
+		name    string
+		args    []string
+		want    string
+		wantErr string
+	}{
+		{
+			"dest project required",
+			[]string{"secret", "move", "DUP_SECRET", "--project", "dst"},
+			"",
+			"required flag(s) \"dest-project\" not set",
+		},
+		{
+			"dest duplicate",
+			[]string{"secret", "move", "DUP_SECRET", "--project", "dst", "--dest-project", "src"},
+			"",
+			"secret 'DUP_SECRET' already exists at destination",
+		},
+		{
+			"move to different project",
+			[]string{"secret", "move", "MY_SECRET", "--project", "src", "--dest-project", "dst"},
+			"Secret 'MY_SECRET' moved to project 'dst'",
+			"",
+		},
+		{
+			"source not found",
+			[]string{"secret", "move", "NONEXISTENT", "--project", "src", "--dest-project", "dst"},
+			"",
+			"secret 'NONEXISTENT' not found",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Restore vault to pristine state and reset leaked flags.
+			if err := os.WriteFile(vaultFile, origVaultBytes, 0600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			resetMoveCopyFlags(t)
+
+			var buf bytes.Buffer
+			rootCmd.SetOut(&buf)
+			rootCmd.SetErr(io.Discard)
+			rootCmd.SetArgs(tt.args)
+			err := rootCmd.Execute()
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("error should contain %q, got: %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			output := buf.String()
+			if !strings.Contains(output, tt.want) {
+				t.Errorf("output should contain %q, got:\n%s", tt.want, output)
+			}
+		})
+	}
+}
+
+func TestSecretCopy(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pSrcUID, _ := v.AddProject(vault.Project{Name: "src"})
+	_, _ = v.AddProject(vault.Project{Name: "dst"})
+	v.AddSecret(vault.Secret{Name: "MY_SECRET", Value: "s3cret", ProjectUID: pSrcUID, URL: "https://example.com", Notes: "test"})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	vaultFile := filepath.Join(dir, vault.FileName)
+	origVaultBytes, err := os.ReadFile(vaultFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	t.Cleanup(func() {
+		rootCmd.SetArgs(nil)
+		resetMoveCopyFlags(t)
+	})
+
+	tests := []struct {
+		name    string
+		args    []string
+		want    string
+		wantErr string
+	}{
+		{
+			"dest project required",
+			[]string{"secret", "copy", "MY_SECRET"},
+			"",
+			"required flag(s) \"dest-project\" not set",
+		},
+		{
+			"dest duplicate",
+			[]string{"secret", "copy", "MY_SECRET", "--project", "src", "--dest-project", "src"},
+			"",
+			"secret 'MY_SECRET' already exists at destination",
+		},
+		{
+			"copy to different project",
+			[]string{"secret", "copy", "MY_SECRET", "--project", "src", "--dest-project", "dst"},
+			"Secret 'MY_SECRET' copied as 'MY_SECRET' to project 'dst'",
+			"",
+		},
+		{
+			"copy with rename",
+			[]string{"secret", "copy", "MY_SECRET", "--project", "src", "--dest-project", "dst", "--name", "RENAMED"},
+			"Secret 'MY_SECRET' copied as 'RENAMED' to project 'dst'",
+			"",
+		},
+		{
+			"source not found",
+			[]string{"secret", "copy", "NONEXISTENT", "--project", "src", "--dest-project", "dst"},
+			"",
+			"secret 'NONEXISTENT' not found",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Restore vault to pristine state and reset leaked flags.
+			if err := os.WriteFile(vaultFile, origVaultBytes, 0600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			resetMoveCopyFlags(t)
+
+			var buf bytes.Buffer
+			rootCmd.SetOut(&buf)
+			rootCmd.SetErr(io.Discard)
+			rootCmd.SetArgs(tt.args)
+			err := rootCmd.Execute()
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("error should contain %q, got: %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			output := buf.String()
+			if !strings.Contains(output, tt.want) {
+				t.Errorf("output should contain %q, got:\n%s", tt.want, output)
+			}
+		})
+	}
+}
+
+func TestSecretMoveWithEnv(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pUID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	devUID, _ := v.AddEnvironment(vault.Environment{Name: "dev", ProjectUID: pUID})
+	_, _ = v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: pUID})
+	v.AddSecret(vault.Secret{Name: "MY_SECRET", Value: "s3cret", ProjectUID: pUID, EnvironmentUID: devUID})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() {
+		rootCmd.SetArgs(nil)
+		resetMoveCopyFlags(t)
+	})
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"secret", "move", "MY_SECRET", "--project", "myapp", "--env", "dev", "--dest-project", "myapp", "--dest-env", "prod"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	output := buf.String()
+	if !strings.Contains(output, "moved to project 'myapp' (env: 'prod')") {
+		t.Errorf("expected env context in output, got:\n%s", output)
 	}
 }
 
@@ -565,5 +863,705 @@ func TestStatusSubcommand(t *testing.T) {
 	}
 	if !found {
 		t.Error("status subcommand not registered with rootCmd")
+	}
+}
+
+// setupTestVault creates a fresh vault in a temp dir, overrides vaultDir,
+// and stubs session + password reading. Returns the temp dir.
+func setupTestVault(t *testing.T) string {
+	t.Helper()
+	stubSession(t)
+	mockReadPassword(t, "password1234", nil)
+	origWarn := warnOut
+	warnOut = io.Discard
+	t.Cleanup(func() { warnOut = origWarn })
+	dir := t.TempDir()
+	origDir := vaultDir
+	vaultDir = dir
+	t.Cleanup(func() { vaultDir = origDir })
+	if err := runInit(dir, "password1234", "password1234"); err != nil {
+		t.Fatalf("runInit: %v", err)
+	}
+	return dir
+}
+
+func TestFindCmdRequiresPattern(t *testing.T) {
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+	rootCmd.SetArgs([]string{"find"})
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for missing pattern argument")
+	}
+}
+
+func TestFindCmdMatchesSecrets(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	// Add test data directly
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pUID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	eUID, _ := v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: pUID})
+	v.AddSecret(vault.Secret{Name: "GitHub Token", ProjectUID: pUID, EnvironmentUID: eUID, Value: "x", URL: "https://github.com", Notes: "PAT"})
+	v.AddSecret(vault.Secret{Name: "AWS Key", Value: "x", URL: "https://aws.amazon.com", Notes: "IAM"})
+	v.AddSecret(vault.Secret{Name: "Database", Value: "x", Notes: "postgres connection"})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	tests := []struct {
+		name    string
+		args    []string
+		want    string
+		wantNot string
+		wantErr string // if non-empty, expect error containing this string
+	}{
+		{"match by name", []string{"find", "GitHub"}, "GitHub Token", "", ""},
+		{"match by URL", []string{"find", "aws.amazon"}, "AWS Key", "", ""},
+		{"match by notes", []string{"find", "postgres"}, "Database", "", ""},
+		{"case insensitive", []string{"find", "github token"}, "GitHub Token", "", ""},
+		{"no match", []string{"find", "nonexistent"}, "No secrets matching 'nonexistent'", "", ""},
+		// Additional tests for project/env scoping
+		{"match by project name", []string{"find", "GitHub", "--project", "myapp"}, "GitHub Token", "AWS Key", ""},
+		{"match by project and env", []string{"find", "GitHub", "--project", "myapp", "--env", "prod"}, "GitHub Token", "AWS Key", ""},
+		{"no match by wrong project", []string{"find", "GitHub", "--project", "nonexistent"}, "", "", "project 'nonexistent' not found"},
+		{"no match by wrong env", []string{"find", "GitHub", "--project", "myapp", "--env", "nonexistent"}, "", "", "environment 'nonexistent' not found"},
+		{"env without project (expect error)", []string{"find", "any_pattern", "--env", "prod"}, "", "", "--env requires --project"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetExportImportFlags()
+			var buf bytes.Buffer
+			rootCmd.SetOut(&buf)
+			rootCmd.SetErr(io.Discard)
+			rootCmd.SetArgs(tt.args)
+			err := rootCmd.Execute()
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("error should contain %q, got: %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("find: %v", err)
+			}
+			output := buf.String()
+			if tt.want != "" && !strings.Contains(output, tt.want) {
+				t.Errorf("output should contain %q, got:\n%s", tt.want, output)
+			}
+			if tt.wantNot != "" && strings.Contains(output, tt.wantNot) {
+				t.Errorf("output should NOT contain %q, got:\n%s", tt.wantNot, output)
+			}
+		})
+	}
+}
+
+func TestSecretListFilter(t *testing.T) {
+	// Reset flags that may persist from previous cobra Execute() calls.
+	secretListCmd.Flags().Set("env", "")
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	v.AddSecret(vault.Secret{Name: "GitHub Token", Value: "x", URL: "https://github.com", Notes: "PAT"})
+	v.AddSecret(vault.Secret{Name: "AWS Key", Value: "x", URL: "https://aws.amazon.com", Notes: "IAM"})
+	v.AddSecret(vault.Secret{Name: "Database", Value: "x", Notes: "postgres"})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	tests := []struct {
+		name    string
+		filter  string
+		want    string
+		wantNot string
+	}{
+		{"filter by name", "github", "GitHub Token", "AWS Key"},
+		{"filter by URL", "aws", "AWS Key", "GitHub Token"},
+		{"filter by notes", "postgres", "Database", "AWS Key"},
+		{"no match", "nonexistent", "No secrets.", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			rootCmd.SetOut(&buf)
+			rootCmd.SetErr(io.Discard)
+			rootCmd.SetArgs([]string{"secret", "list", "--filter", tt.filter})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("secret list: %v", err)
+			}
+			output := buf.String()
+			if tt.want != "" && !strings.Contains(output, tt.want) {
+				t.Errorf("output should contain %q, got:\n%s", tt.want, output)
+			}
+			if tt.wantNot != "" && strings.Contains(output, tt.wantNot) {
+				t.Errorf("output should NOT contain %q, got:\n%s", tt.wantNot, output)
+			}
+		})
+	}
+}
+
+// --- export/import tests ---
+
+// seedVault adds test data to the vault and saves it.
+func seedVault(t *testing.T, dir string) {
+	t.Helper()
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pUID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	eUID, _ := v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: pUID})
+	v.AddSecret(vault.Secret{Name: "DB_PASS", Value: "s3cret", ProjectUID: pUID, EnvironmentUID: eUID, URL: "https://db.example.com", Notes: "database"})
+	v.AddSecret(vault.Secret{Name: "API_KEY", Value: "key123", ProjectUID: pUID, EnvironmentUID: eUID})
+	v.AddSecret(vault.Secret{Name: "STANDALONE", Value: "solo"})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+}
+
+// resetCmdFlags resets cobra flag values that leak between Execute() calls.
+// pflag doesn't reset unset flags between parses, so we must do it explicitly.
+func resetCmdFlags(t *testing.T) {
+	t.Helper()
+	resetExportImportFlags()
+	t.Cleanup(resetExportImportFlags)
+}
+
+func resetExportImportFlags() {
+	rootCmd.SetArgs(nil)
+	for _, name := range []string{"project", "env", "format"} {
+		_ = exportCmd.Flags().Set(name, "")
+		_ = importCmd.Flags().Set(name, "")
+	}
+	for _, name := range []string{"project", "env"} {
+		_ = findCmd.Flags().Set(name, "")
+	}
+}
+
+func TestExportJSON(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	seedVault(t, dir)
+
+	outFile := filepath.Join(t.TempDir(), "export.json")
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"export", outFile})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if !strings.Contains(buf.String(), "Exported 3 secrets") {
+		t.Errorf("expected 3 secrets exported, got: %s", buf.String())
+	}
+
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var entries []exportEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(entries))
+	}
+	for _, e := range entries {
+		switch e.Name {
+		case "DB_PASS":
+			if e.Value != "s3cret" {
+				t.Errorf("DB_PASS value = %q, want %q", e.Value, "s3cret")
+			}
+			if e.Project != "myapp" {
+				t.Errorf("DB_PASS project = %q, want %q", e.Project, "myapp")
+			}
+			if e.URL != "https://db.example.com" {
+				t.Errorf("DB_PASS URL = %q", e.URL)
+			}
+		case "API_KEY", "STANDALONE":
+			// ok
+		default:
+			t.Errorf("unexpected entry: %s", e.Name)
+		}
+	}
+}
+
+func TestExportJSONScoped(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	seedVault(t, dir)
+
+	outFile := filepath.Join(t.TempDir(), "scoped.json")
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"export", outFile, "--project", "myapp"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if !strings.Contains(buf.String(), "Exported 2 secrets") {
+		t.Errorf("expected 2 secrets, got: %s", buf.String())
+	}
+
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var entries []exportEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	for _, e := range entries {
+		if e.Project != "myapp" {
+			t.Errorf("entry %q has project %q, want %q", e.Name, e.Project, "myapp")
+		}
+	}
+}
+
+func TestExportEnv(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	seedVault(t, dir)
+
+	outFile := filepath.Join(t.TempDir(), "export.env")
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"export", outFile})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "DB_PASS=s3cret") {
+		t.Errorf("missing DB_PASS=s3cret in .env output:\n%s", content)
+	}
+	if !strings.Contains(content, "API_KEY=key123") {
+		t.Errorf("missing API_KEY=key123 in .env output:\n%s", content)
+	}
+	if !strings.Contains(content, "# Project: myapp | Env: prod") {
+		t.Errorf("missing scope comment in .env output:\n%s", content)
+	}
+}
+
+func TestExportAutoDetect(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	seedVault(t, dir)
+
+	outJSON := filepath.Join(t.TempDir(), "auto.json")
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"export", outJSON})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("export json: %v", err)
+	}
+	data, _ := os.ReadFile(outJSON)
+	var entries []exportEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Errorf("expected JSON output, got parse error: %v", err)
+	}
+
+	outEnv := filepath.Join(t.TempDir(), "auto.env")
+	buf.Reset()
+	rootCmd.SetOut(&buf)
+	rootCmd.SetArgs([]string{"export", outEnv})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("export env: %v", err)
+	}
+	envData, _ := os.ReadFile(outEnv)
+	if !strings.Contains(string(envData), "=") {
+		t.Errorf("expected .env output with KEY=value, got:\n%s", envData)
+	}
+}
+
+func TestExportUnknownFormat(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	seedVault(t, dir)
+
+	outFile := filepath.Join(t.TempDir(), "export.txt")
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"export", outFile})
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for .txt extension")
+	}
+	if !strings.Contains(err.Error(), "cannot detect format") {
+		t.Errorf("error should mention 'cannot detect format', got: %v", err)
+	}
+}
+
+func TestExportEnvRequiresProject(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	seedVault(t, dir)
+
+	outFile := filepath.Join(t.TempDir(), "export.env")
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"export", outFile, "--env", "prod"})
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for --env without --project")
+	}
+	if !strings.Contains(err.Error(), "--env requires --project") {
+		t.Errorf("error should mention '--env requires --project', got: %v", err)
+	}
+}
+
+func TestImportJSON(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+
+	importData := `[{"name":"NEW_SECRET","project":"myapp","env":"prod","value":"imported","url":"https://example.com","notes":"from json"}]`
+	importFile := filepath.Join(t.TempDir(), "import.json")
+	if err := os.WriteFile(importFile, []byte(importData), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"import", importFile})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	output := buf.String()
+	if !strings.Contains(output, "Added:   1 secrets") {
+		t.Errorf("expected 1 added secret, got:\n%s", output)
+	}
+
+	salt, _ := vault.GetSalt(dir)
+	key := crypto.DeriveKey("password1234", salt)
+	v, _ := vault.Open(dir, key)
+	p, _, pf := findProjectByName(v, "myapp")
+	if !pf {
+		t.Fatal("project 'myapp' not found after import")
+	}
+	e, _, ef := findEnvironmentByName(v, "prod", p.UID)
+	if !ef {
+		t.Fatal("environment 'prod' not found after import")
+	}
+	_, _, found := v.FindSecretByName("NEW_SECRET", p.UID, e.UID)
+	if !found {
+		t.Error("NEW_SECRET not found after import")
+	}
+}
+
+func TestImportJSONCreatesProjectEnv(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+
+	importData := `[{"name":"CREATED_SECRET","project":"brand-new","env":"staging","value":"test123"}]`
+	importFile := filepath.Join(t.TempDir(), "create.json")
+	if err := os.WriteFile(importFile, []byte(importData), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"import", importFile})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	output := buf.String()
+	if !strings.Contains(output, "Added:   1 secrets") {
+		t.Errorf("expected 1 added, got:\n%s", output)
+	}
+
+	salt, _ := vault.GetSalt(dir)
+	key := crypto.DeriveKey("password1234", salt)
+	v, _ := vault.Open(dir, key)
+	p, _, found := findProjectByName(v, "brand-new")
+	if !found {
+		t.Fatal("project 'brand-new' not created")
+	}
+	_, _, found = findEnvironmentByName(v, "staging", p.UID)
+	if !found {
+		t.Fatal("environment 'staging' not created in project 'brand-new'")
+	}
+}
+
+func TestImportEnv(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, _ := vault.GetSalt(dir)
+	key := crypto.DeriveKey("password1234", salt)
+	v, _ := vault.Open(dir, key)
+	pUID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	v.AddEnvironment(vault.Environment{Name: "dev", ProjectUID: pUID})
+	v.Save(dir, key)
+
+	importFile := filepath.Join(t.TempDir(), "import.env")
+	if err := os.WriteFile(importFile, []byte("NEW_VAR=hello\nOTHER_VAR=world\n"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"import", importFile, "--project", "myapp", "--env", "dev"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	output := buf.String()
+	if !strings.Contains(output, "Added:   2 secrets") {
+		t.Errorf("expected 2 added, got:\n%s", output)
+	}
+}
+
+func TestImportEnvRequiresProject(t *testing.T) {
+	resetCmdFlags(t)
+	importFile := filepath.Join(t.TempDir(), "import.env")
+	if err := os.WriteFile(importFile, []byte("KEY=val\n"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"import", importFile})
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for .env import without --project")
+	}
+	if !strings.Contains(err.Error(), "--project is required") {
+		t.Errorf("error should mention '--project is required', got: %v", err)
+	}
+}
+
+func TestImportSkipsDuplicates(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	seedVault(t, dir)
+
+	importData := `[{"name":"DB_PASS","value":"new_value","project":"myapp","env":"prod"}]`
+	importFile := filepath.Join(t.TempDir(), "dup.json")
+	if err := os.WriteFile(importFile, []byte(importData), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"import", importFile})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	output := buf.String()
+	if !strings.Contains(output, "Added:   0 secrets") {
+		t.Errorf("expected 0 added, got:\n%s", output)
+	}
+	if !strings.Contains(output, "Skipped: 1 secrets") {
+		t.Errorf("expected 1 skipped, got:\n%s", output)
+	}
+	if !strings.Contains(output, "DB_PASS") {
+		t.Errorf("skipped list should mention DB_PASS, got:\n%s", output)
+	}
+}
+
+func TestImportSummaryOutput(t *testing.T) {
+	resetCmdFlags(t)
+	setupTestVault(t)
+
+	importData := `[{"name":"A","value":"1","project":"p1"},{"name":"B","value":"2","project":"p1"}]`
+	importFile := filepath.Join(t.TempDir(), "summary.json")
+	if err := os.WriteFile(importFile, []byte(importData), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"import", importFile})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	output := buf.String()
+	if !strings.Contains(output, "Import complete:") {
+		t.Errorf("missing header:\n%s", output)
+	}
+	if !strings.Contains(output, "Added:   2 secrets") {
+		t.Errorf("expected 2 added, got:\n%s", output)
+	}
+
+	// Re-import — should skip both
+	buf.Reset()
+	rootCmd.SetOut(&buf)
+	rootCmd.SetArgs([]string{"import", importFile})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("import (re-import): %v", err)
+	}
+	output = buf.String()
+	if !strings.Contains(output, "Added:   0 secrets") {
+		t.Errorf("re-import: expected 0 added, got:\n%s", output)
+	}
+	if !strings.Contains(output, "Skipped: 2 secrets") {
+		t.Errorf("re-import: expected 2 skipped, got:\n%s", output)
+	}
+}
+
+func TestImportEnvParsesComments(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, _ := vault.GetSalt(dir)
+	key := crypto.DeriveKey("password1234", salt)
+	v, _ := vault.Open(dir, key)
+	pUID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	v.Save(dir, key)
+
+	envContent := "# This is a comment\nREAL_VALUE=hello\n# Another comment\n\n\nANOTHER=world\n"
+	importFile := filepath.Join(t.TempDir(), "comments.env")
+	if err := os.WriteFile(importFile, []byte(envContent), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"import", importFile, "--project", "myapp"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	output := buf.String()
+	if !strings.Contains(output, "Added:   2 secrets") {
+		t.Errorf("expected 2 added (comments/blanks skipped), got:\n%s", output)
+	}
+
+	v2, _ := vault.Open(dir, key)
+	_, _, f1 := v2.FindSecretByName("REAL_VALUE", pUID, "")
+	_, _, f2 := v2.FindSecretByName("ANOTHER", pUID, "")
+	if !f1 || !f2 {
+		t.Error("secrets not found after import with comments")
+	}
+}
+
+func TestImportEnvParsesQuotes(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, _ := vault.GetSalt(dir)
+	key := crypto.DeriveKey("password1234", salt)
+	v, _ := vault.Open(dir, key)
+	pUID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	v.Save(dir, key)
+
+	envContent := "DB_HOST=\"localhost\"\nDB_PORT='5432'\nDB_CONN=\"host=localhost port=5432\"\n"
+	importFile := filepath.Join(t.TempDir(), "quoted.env")
+	if err := os.WriteFile(importFile, []byte(envContent), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"import", importFile, "--project", "myapp"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	v2, _ := vault.Open(dir, key)
+	s1, _, f1 := v2.FindSecretByName("DB_HOST", pUID, "")
+	s2, _, f2 := v2.FindSecretByName("DB_PORT", pUID, "")
+	s3, _, f3 := v2.FindSecretByName("DB_CONN", pUID, "")
+	if !f1 || !f2 || !f3 {
+		t.Fatal("secrets not found after quoted import")
+	}
+	if s1.Value != "localhost" {
+		t.Errorf("DB_HOST value = %q, want %q", s1.Value, "localhost")
+	}
+	if s2.Value != "5432" {
+		t.Errorf("DB_PORT value = %q, want %q", s2.Value, "5432")
+	}
+	if s3.Value != "host=localhost port=5432" {
+		t.Errorf("DB_CONN value = %q, want %q", s3.Value, "host=localhost port=5432")
+	}
+}
+
+func TestExportImportRoundtrip(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	seedVault(t, dir)
+
+	// Export to JSON
+	outFile := filepath.Join(t.TempDir(), "roundtrip.json")
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"export", outFile})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	// Create a fresh vault with the same project name
+	dir2 := setupTestVault(t)
+	salt2, _ := vault.GetSalt(dir2)
+	key2 := crypto.DeriveKey("password1234", salt2)
+	v2, _ := vault.Open(dir2, key2)
+	v2.AddProject(vault.Project{Name: "myapp"})
+	v2.Save(dir2, key2)
+
+	// Import into fresh vault
+	buf.Reset()
+	rootCmd.SetOut(&buf)
+	rootCmd.SetArgs([]string{"import", outFile})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if !strings.Contains(buf.String(), "Added:   3 secrets") {
+		t.Errorf("roundtrip: expected 3 added, got:\n%s", buf.String())
+	}
+
+	v3, _ := vault.Open(dir2, key2)
+	secrets := v3.ListSecrets()
+	if len(secrets) != 3 {
+		t.Errorf("expected 3 secrets after roundtrip, got %d", len(secrets))
+	}
+	names := make(map[string]bool)
+	for _, s := range secrets {
+		names[s.Name] = true
+	}
+	for _, name := range []string{"DB_PASS", "API_KEY", "STANDALONE"} {
+		if !names[name] {
+			t.Errorf("secret %q not found after roundtrip", name)
+		}
 	}
 }

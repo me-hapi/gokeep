@@ -117,8 +117,12 @@ gokeep/
 
 ## Roadmap
 
-- [ ] Import/export (CSV, JSON)
-- [ ] Secret editing (`gokeep edit`)
+- [x] Import/export (.env, JSON)
+- [x] Secret move/copy between environments
+- [x] Secret search (`gokeep find`, `--filter` on list)
+- [x] Secret show (metadata without value)
+- [x] Cobra CLI migration
+- [ ] JSON output for list/show/reveal (`--format=json`)
 - [ ] Password generator
 - [ ] Clipboard integration
 - [ ] REST API with OpenAPI spec
