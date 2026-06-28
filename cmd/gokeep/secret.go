@@ -185,10 +185,117 @@ var secretRemoveCmd = &cobra.Command{
 	},
 }
 
+var secretMoveCmd = &cobra.Command{
+	Use:   "move <name>",
+	Short: "Move a secret to a different scope",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if vaultDir == "" {
+			return errors.New("cannot determine home directory")
+		}
+		name := args[0]
+		projectName, _ := cmd.Flags().GetString("project")
+		envName, _ := cmd.Flags().GetString("env")
+		destProjectName, _ := cmd.Flags().GetString("dest-project")
+		destEnvName, _ := cmd.Flags().GetString("dest-env")
+		v, key, err := openVault(vaultDir, cmd.ErrOrStderr(), cmd.ErrOrStderr())
+		if err != nil {
+			return err
+		}
+		projectUID, envUID, err := resolveScope(v, projectName, envName)
+		if err != nil {
+			return err
+		}
+		_, uid, found := v.FindSecretByName(name, projectUID, envUID)
+		if !found {
+			return fmt.Errorf("secret '%s' not found in the given scope", name)
+		}
+		destProjectUID, destEnvUID, err := resolveScope(v, destProjectName, destEnvName)
+		if err != nil {
+			return err
+		}
+		if _, _, found := v.FindSecretByName(name, destProjectUID, destEnvUID); found {
+			return fmt.Errorf("secret '%s' already exists at destination", name)
+		}
+		v.UpdateSecret(uid, func(s *vault.Secret) {
+			s.ProjectUID = destProjectUID
+			s.EnvironmentUID = destEnvUID
+		})
+		if err := saveVault(v, vaultDir, key, cmd.ErrOrStderr()); err != nil {
+			return err
+		}
+		msg := fmt.Sprintf("Secret '%s' moved to project '%s'", name, destProjectName)
+		if destEnvName != "" {
+			msg += fmt.Sprintf(" (env: '%s')", destEnvName)
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "%s.\n", msg)
+		return nil
+	},
+}
+
+var secretCopyCmd = &cobra.Command{
+	Use:   "copy <name>",
+	Short: "Copy a secret to a different scope",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if vaultDir == "" {
+			return errors.New("cannot determine home directory")
+		}
+		name := args[0]
+		projectName, _ := cmd.Flags().GetString("project")
+		envName, _ := cmd.Flags().GetString("env")
+		destProjectName, _ := cmd.Flags().GetString("dest-project")
+		destEnvName, _ := cmd.Flags().GetString("dest-env")
+		v, key, err := openVault(vaultDir, cmd.ErrOrStderr(), cmd.ErrOrStderr())
+		if err != nil {
+			return err
+		}
+		projectUID, envUID, err := resolveScope(v, projectName, envName)
+		if err != nil {
+			return err
+		}
+		secret, _, found := v.FindSecretByName(name, projectUID, envUID)
+		if !found {
+			return fmt.Errorf("secret '%s' not found in the given scope", name)
+		}
+		destName := name
+		if cmd.Flags().Changed("name") {
+			destName, _ = cmd.Flags().GetString("name")
+		}
+		destProjectUID, destEnvUID, err := resolveScope(v, destProjectName, destEnvName)
+		if err != nil {
+			return err
+		}
+		if _, _, found := v.FindSecretByName(destName, destProjectUID, destEnvUID); found {
+			return fmt.Errorf("secret '%s' already exists at destination", destName)
+		}
+		uid, err := v.AddSecret(vault.Secret{
+			Name:           destName,
+			ProjectUID:     destProjectUID,
+			EnvironmentUID: destEnvUID,
+			Value:          secret.Value,
+			URL:            secret.URL,
+			Notes:          secret.Notes,
+		})
+		if err != nil {
+			return err
+		}
+		if err := saveVault(v, vaultDir, key, cmd.ErrOrStderr()); err != nil {
+			return err
+		}
+		msg := fmt.Sprintf("Secret '%s' copied as '%s' to project '%s'", name, destName, destProjectName)
+		if destEnvName != "" {
+			msg += fmt.Sprintf(" (env: '%s')", destEnvName)
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "%s (UID: %s).\n", msg, shortUID(uid))
+		return nil
+	},
+}
+
 func init() {
 	rootCmd.AddCommand(secretCmd)
 	secretCmd.PersistentFlags().String("project", "", "Project name")
-	secretCmd.AddCommand(secretAddCmd, secretEditCmd, secretRemoveCmd, secretListCmd, secretRevealCmd, secretShowCmd)
+	secretCmd.AddCommand(secretAddCmd, secretEditCmd, secretRemoveCmd, secretListCmd, secretRevealCmd, secretShowCmd, secretMoveCmd, secretCopyCmd)
 	secretAddCmd.Flags().String("env", "", "Environment name")
 	secretAddCmd.Flags().String("value", "", "Secret value")
 	secretAddCmd.Flags().String("url", "", "URL")
@@ -202,4 +309,13 @@ func init() {
 	secretListCmd.Flags().String("filter", "", "Filter secrets by name, URL, or notes")
 	secretRevealCmd.Flags().String("env", "", "Environment name")
 	secretShowCmd.Flags().String("env", "", "Environment name")
+	secretMoveCmd.Flags().String("dest-project", "", "Destination project name")
+	secretMoveCmd.Flags().String("dest-env", "", "Destination environment name")
+	secretMoveCmd.Flags().String("env", "", "Source environment name")
+	secretCopyCmd.Flags().String("dest-project", "", "Destination project name")
+	secretCopyCmd.Flags().String("dest-env", "", "Destination environment name")
+	secretCopyCmd.Flags().String("env", "", "Source environment name")
+	secretCopyCmd.Flags().String("name", "", "Name for the copy")
+	secretMoveCmd.MarkFlagRequired("dest-project")
+	secretCopyCmd.MarkFlagRequired("dest-project")
 }

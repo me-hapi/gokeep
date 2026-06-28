@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+
 	"github.com/youruser/gokeep/internal/crypto"
 	"github.com/youruser/gokeep/internal/session"
 	"github.com/youruser/gokeep/internal/vault"
@@ -388,7 +391,7 @@ func TestSecretSubcommands(t *testing.T) {
 	for _, c := range subs {
 		names[c.Name()] = true
 	}
-	expected := []string{"add", "edit", "remove", "list", "reveal", "show"}
+	expected := []string{"add", "edit", "remove", "list", "reveal", "show", "move", "copy"}
 	for _, n := range expected {
 		if !names[n] {
 			t.Errorf("secret missing subcommand: %s", n)
@@ -416,6 +419,298 @@ func TestSecretAddFlags(t *testing.T) {
 		if secretAddCmd.Flags().Lookup(name) == nil {
 			t.Errorf("secret add missing flag: %s", name)
 		}
+	}
+}
+
+// --- secret move/copy tests ---
+
+// resetMoveCopyFlags resets cobra flag state for secret move/copy commands
+// and the parent secretCmd persistent flags. pflag.Set() marks Changed=true
+// permanently; this resets both the value and Changed so required flag checks
+// and scoped lookups work correctly across table-driven subtests.
+func resetMoveCopyFlags(t *testing.T) {
+	t.Helper()
+	resetFlag(t, secretCmd.PersistentFlags(), "project")
+	for _, name := range []string{"dest-project", "dest-env", "env"} {
+		resetFlag(t, secretMoveCmd.Flags(), name)
+	}
+	for _, name := range []string{"dest-project", "dest-env", "env", "name"} {
+		resetFlag(t, secretCopyCmd.Flags(), name)
+	}
+}
+
+func resetFlag(t *testing.T, fs *pflag.FlagSet, name string) {
+	t.Helper()
+	f := fs.Lookup(name)
+	if f == nil {
+		return
+	}
+	_ = f.Value.Set("")
+	f.Changed = false
+}
+
+func TestSecretMoveFlags(t *testing.T) {
+	if secretMoveCmd.Flags().Lookup("dest-project") == nil {
+		t.Error("secret move missing --dest-project flag")
+	}
+	if secretMoveCmd.Flags().Lookup("dest-env") == nil {
+		t.Error("secret move missing --dest-env flag")
+	}
+	if secretMoveCmd.Flags().Lookup("env") == nil {
+		t.Error("secret move missing --env flag")
+	}
+	if secretMoveCmd.Flags().Lookup("dest-project").Annotations[cobra.BashCompOneRequiredFlag] == nil {
+		t.Error("--dest-project should be required")
+	}
+}
+
+func TestSecretCopyFlags(t *testing.T) {
+	if secretCopyCmd.Flags().Lookup("dest-project") == nil {
+		t.Error("secret copy missing --dest-project flag")
+	}
+	if secretCopyCmd.Flags().Lookup("dest-env") == nil {
+		t.Error("secret copy missing --dest-env flag")
+	}
+	if secretCopyCmd.Flags().Lookup("env") == nil {
+		t.Error("secret copy missing --env flag")
+	}
+	if secretCopyCmd.Flags().Lookup("name") == nil {
+		t.Error("secret copy missing --name flag")
+	}
+	if secretCopyCmd.Flags().Lookup("dest-project").Annotations[cobra.BashCompOneRequiredFlag] == nil {
+		t.Error("--dest-project should be required")
+	}
+}
+
+func TestSecretMove(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pSrcUID, _ := v.AddProject(vault.Project{Name: "src"})
+	pDstUID, _ := v.AddProject(vault.Project{Name: "dst"})
+	v.AddSecret(vault.Secret{Name: "MY_SECRET", Value: "s3cret", ProjectUID: pSrcUID, URL: "https://example.com", Notes: "test"})
+	v.AddSecret(vault.Secret{Name: "DUP_SECRET", Value: "dup", ProjectUID: pSrcUID})
+	v.AddSecret(vault.Secret{Name: "DUP_SECRET", Value: "dup", ProjectUID: pDstUID})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	vaultFile := filepath.Join(dir, vault.FileName)
+	origVaultBytes, err := os.ReadFile(vaultFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	t.Cleanup(func() {
+		rootCmd.SetArgs(nil)
+		resetMoveCopyFlags(t)
+	})
+
+	tests := []struct {
+		name    string
+		args    []string
+		want    string
+		wantErr string
+	}{
+		{
+			"dest project required",
+			[]string{"secret", "move", "DUP_SECRET", "--project", "dst"},
+			"",
+			"required flag(s) \"dest-project\" not set",
+		},
+		{
+			"dest duplicate",
+			[]string{"secret", "move", "DUP_SECRET", "--project", "dst", "--dest-project", "src"},
+			"",
+			"secret 'DUP_SECRET' already exists at destination",
+		},
+		{
+			"move to different project",
+			[]string{"secret", "move", "MY_SECRET", "--project", "src", "--dest-project", "dst"},
+			"Secret 'MY_SECRET' moved to project 'dst'",
+			"",
+		},
+		{
+			"source not found",
+			[]string{"secret", "move", "NONEXISTENT", "--project", "src", "--dest-project", "dst"},
+			"",
+			"secret 'NONEXISTENT' not found",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Restore vault to pristine state and reset leaked flags.
+			if err := os.WriteFile(vaultFile, origVaultBytes, 0600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			resetMoveCopyFlags(t)
+
+			var buf bytes.Buffer
+			rootCmd.SetOut(&buf)
+			rootCmd.SetErr(io.Discard)
+			rootCmd.SetArgs(tt.args)
+			err := rootCmd.Execute()
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("error should contain %q, got: %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			output := buf.String()
+			if !strings.Contains(output, tt.want) {
+				t.Errorf("output should contain %q, got:\n%s", tt.want, output)
+			}
+		})
+	}
+}
+
+func TestSecretCopy(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pSrcUID, _ := v.AddProject(vault.Project{Name: "src"})
+	_, _ = v.AddProject(vault.Project{Name: "dst"})
+	v.AddSecret(vault.Secret{Name: "MY_SECRET", Value: "s3cret", ProjectUID: pSrcUID, URL: "https://example.com", Notes: "test"})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	vaultFile := filepath.Join(dir, vault.FileName)
+	origVaultBytes, err := os.ReadFile(vaultFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	t.Cleanup(func() {
+		rootCmd.SetArgs(nil)
+		resetMoveCopyFlags(t)
+	})
+
+	tests := []struct {
+		name    string
+		args    []string
+		want    string
+		wantErr string
+	}{
+		{
+			"dest project required",
+			[]string{"secret", "copy", "MY_SECRET"},
+			"",
+			"required flag(s) \"dest-project\" not set",
+		},
+		{
+			"dest duplicate",
+			[]string{"secret", "copy", "MY_SECRET", "--project", "src", "--dest-project", "src"},
+			"",
+			"secret 'MY_SECRET' already exists at destination",
+		},
+		{
+			"copy to different project",
+			[]string{"secret", "copy", "MY_SECRET", "--project", "src", "--dest-project", "dst"},
+			"Secret 'MY_SECRET' copied as 'MY_SECRET' to project 'dst'",
+			"",
+		},
+		{
+			"copy with rename",
+			[]string{"secret", "copy", "MY_SECRET", "--project", "src", "--dest-project", "dst", "--name", "RENAMED"},
+			"Secret 'MY_SECRET' copied as 'RENAMED' to project 'dst'",
+			"",
+		},
+		{
+			"source not found",
+			[]string{"secret", "copy", "NONEXISTENT", "--project", "src", "--dest-project", "dst"},
+			"",
+			"secret 'NONEXISTENT' not found",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Restore vault to pristine state and reset leaked flags.
+			if err := os.WriteFile(vaultFile, origVaultBytes, 0600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			resetMoveCopyFlags(t)
+
+			var buf bytes.Buffer
+			rootCmd.SetOut(&buf)
+			rootCmd.SetErr(io.Discard)
+			rootCmd.SetArgs(tt.args)
+			err := rootCmd.Execute()
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("error should contain %q, got: %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			output := buf.String()
+			if !strings.Contains(output, tt.want) {
+				t.Errorf("output should contain %q, got:\n%s", tt.want, output)
+			}
+		})
+	}
+}
+
+func TestSecretMoveWithEnv(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pUID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	devUID, _ := v.AddEnvironment(vault.Environment{Name: "dev", ProjectUID: pUID})
+	_, _ = v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: pUID})
+	v.AddSecret(vault.Secret{Name: "MY_SECRET", Value: "s3cret", ProjectUID: pUID, EnvironmentUID: devUID})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() {
+		rootCmd.SetArgs(nil)
+		resetMoveCopyFlags(t)
+	})
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"secret", "move", "MY_SECRET", "--project", "myapp", "--env", "dev", "--dest-project", "myapp", "--dest-env", "prod"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	output := buf.String()
+	if !strings.Contains(output, "moved to project 'myapp' (env: 'prod')") {
+		t.Errorf("expected env context in output, got:\n%s", output)
 	}
 }
 
