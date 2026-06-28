@@ -578,6 +578,42 @@ func TestAddSecretNoCollisionDifferentScope(t *testing.T) {
 	}
 }
 
+func TestSearchSecrets(t *testing.T) {
+	v := &Vault{
+		Projects:     make(map[string]Project),
+		Environments: make(map[string]Environment),
+		Secrets:      make(map[string]Secret),
+	}
+	v.Secrets["uid1"] = Secret{Name: "GitHub Token", URL: "https://github.com", Notes: "personal access token"}
+	v.Secrets["uid2"] = Secret{Name: "AWS Key", URL: "https://aws.amazon.com", Notes: "IAM user key"}
+	v.Secrets["uid3"] = Secret{Name: "Database", URL: "", Notes: "postgres connection"}
+	v.Secrets["uid4"] = Secret{Name: "token fallback", URL: "", Notes: ""}
+
+	tests := []struct {
+		name    string
+		pattern string
+		want    int
+	}{
+		{"empty pattern returns all", "", 4},
+		{"exact name match", "GitHub Token", 1},
+		{"partial name match lowercase", "token", 2}, // GitHub Token + token fallback
+		{"url match", "aws.amazon.com", 1},
+		{"notes match", "postgres", 1},
+		{"case insensitive name", "github token", 1},
+		{"case insensitive url", "AWS.AMAZON.COM", 1},
+		{"case insensitive notes", "POSTGRES", 1},
+		{"no match", "nonexistent", 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			results := v.SearchSecrets(tt.pattern)
+			if len(results) != tt.want {
+				t.Errorf("SearchSecrets(%q) returned %d results, want %d", tt.pattern, len(results), tt.want)
+			}
+		})
+	}
+}
+
 func TestAddRemoveReAdd(t *testing.T) {
 	v := &Vault{Projects: map[string]Project{}}
 	uid1, err := v.AddProject(Project{Name: "web"})

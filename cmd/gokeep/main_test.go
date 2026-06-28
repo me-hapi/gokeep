@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/youruser/gokeep/internal/crypto"
 	"github.com/youruser/gokeep/internal/session"
 	"github.com/youruser/gokeep/internal/vault"
 )
@@ -328,7 +330,7 @@ func TestRootCommandStructure(t *testing.T) {
 	for _, c := range subs {
 		names[c.Name()] = true
 	}
-	expected := []string{"init", "lock", "reset", "list", "project", "env", "secret", "status"}
+	expected := []string{"init", "lock", "reset", "list", "project", "env", "secret", "status", "find"}
 	for _, n := range expected {
 		if !names[n] {
 			t.Errorf("root missing subcommand: %s", n)
@@ -565,5 +567,147 @@ func TestStatusSubcommand(t *testing.T) {
 	}
 	if !found {
 		t.Error("status subcommand not registered with rootCmd")
+	}
+}
+
+// setupTestVault creates a fresh vault in a temp dir, overrides vaultDir,
+// and stubs session + password reading. Returns the temp dir.
+func setupTestVault(t *testing.T) string {
+	t.Helper()
+	stubSession(t)
+	mockReadPassword(t, "password1234", nil)
+	origWarn := warnOut
+	warnOut = io.Discard
+	t.Cleanup(func() { warnOut = origWarn })
+	dir := t.TempDir()
+	origDir := vaultDir
+	vaultDir = dir
+	t.Cleanup(func() { vaultDir = origDir })
+	if err := runInit(dir, "password1234", "password1234"); err != nil {
+		t.Fatalf("runInit: %v", err)
+	}
+	return dir
+}
+
+func TestFindCmdRequiresPattern(t *testing.T) {
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+	rootCmd.SetArgs([]string{"find"})
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for missing pattern argument")
+	}
+}
+
+func TestFindCmdMatchesSecrets(t *testing.T) {
+	dir := setupTestVault(t)
+	// Add test data directly
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pUID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	eUID, _ := v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: pUID})
+	v.AddSecret(vault.Secret{Name: "GitHub Token", ProjectUID: pUID, EnvironmentUID: eUID, Value: "x", URL: "https://github.com", Notes: "PAT"})
+	v.AddSecret(vault.Secret{Name: "AWS Key", Value: "x", URL: "https://aws.amazon.com", Notes: "IAM"})
+	v.AddSecret(vault.Secret{Name: "Database", Value: "x", Notes: "postgres connection"})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	tests := []struct {
+		name    string
+		args    []string
+		want    string
+		wantNot string
+	}{
+		{"match by name", []string{"find", "GitHub"}, "GitHub Token", ""},
+		{"match by URL", []string{"find", "aws.amazon"}, "AWS Key", ""},
+		{"match by notes", []string{"find", "postgres"}, "Database", ""},
+		{"case insensitive", []string{"find", "github token"}, "GitHub Token", ""},
+		{"no match", []string{"find", "nonexistent"}, "No secrets matching 'nonexistent'", ""},
+		// Additional tests for project/env scoping
+		{"match by project name", []string{"find", "GitHub", "--project", "myapp"}, "GitHub Token", "AWS Key"},
+		{"match by project and env", []string{"find", "GitHub", "--project", "myapp", "--env", "prod"}, "GitHub Token", "AWS Key"},
+		{"no match by wrong project", []string{"find", "GitHub", "--project", "nonexistent"}, "No secrets matching 'GitHub'", "GitHub Token"},
+		{"no match by wrong env", []string{"find", "GitHub", "--project", "myapp", "--env", "nonexistent"}, "No secrets matching 'GitHub'", "GitHub Token"},
+		{"env without project (expect error)", []string{"find", "any_pattern", "--env", "prod"}, "Error: --env requires --project", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			rootCmd.SetOut(&buf)
+			rootCmd.SetErr(io.Discard)
+			rootCmd.SetArgs(tt.args)
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("find: %v", err)
+			}
+			output := buf.String()
+			if tt.want != "" && !strings.Contains(output, tt.want) {
+				t.Errorf("output should contain %q, got:\n%s", tt.want, output)
+			}
+			if tt.wantNot != "" && strings.Contains(output, tt.wantNot) {
+				t.Errorf("output should NOT contain %q, got:\n%s", tt.wantNot, output)
+			}
+		})
+	}
+}
+
+func TestSecretListFilter(t *testing.T) {
+	// Reset flags that may persist from previous cobra Execute() calls.
+	secretListCmd.Flags().Set("env", "")
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	v.AddSecret(vault.Secret{Name: "GitHub Token", Value: "x", URL: "https://github.com", Notes: "PAT"})
+	v.AddSecret(vault.Secret{Name: "AWS Key", Value: "x", URL: "https://aws.amazon.com", Notes: "IAM"})
+	v.AddSecret(vault.Secret{Name: "Database", Value: "x", Notes: "postgres"})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	tests := []struct {
+		name    string
+		filter  string
+		want    string
+		wantNot string
+	}{
+		{"filter by name", "github", "GitHub Token", "AWS Key"},
+		{"filter by URL", "aws", "AWS Key", "GitHub Token"},
+		{"filter by notes", "postgres", "Database", "AWS Key"},
+		{"no match", "nonexistent", "No secrets.", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			rootCmd.SetOut(&buf)
+			rootCmd.SetErr(io.Discard)
+			rootCmd.SetArgs([]string{"secret", "list", "--filter", tt.filter})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("secret list: %v", err)
+			}
+			output := buf.String()
+			if tt.want != "" && !strings.Contains(output, tt.want) {
+				t.Errorf("output should contain %q, got:\n%s", tt.want, output)
+			}
+			if tt.wantNot != "" && strings.Contains(output, tt.wantNot) {
+				t.Errorf("output should NOT contain %q, got:\n%s", tt.wantNot, output)
+			}
+		})
 	}
 }

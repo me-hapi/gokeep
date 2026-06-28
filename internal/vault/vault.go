@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -580,6 +581,24 @@ func (v *Vault) FindSecretByName(name string, projectUID, envUID string) (Secret
 		return s, uid, true
 	}
 	return Secret{}, "", false
+}
+
+// SearchSecrets returns secrets whose Name, URL, or Notes contain the pattern (case-insensitive).
+// An empty pattern returns all secrets.
+func (v *Vault) SearchSecrets(pattern string) map[string]Secret {
+	if pattern == "" {
+		return v.ListSecrets()
+	}
+	lower := strings.ToLower(pattern)
+	result := make(map[string]Secret)
+	for uid, s := range v.Secrets {
+		if strings.Contains(strings.ToLower(s.Name), lower) ||
+			strings.Contains(strings.ToLower(s.URL), lower) ||
+			strings.Contains(strings.ToLower(s.Notes), lower) {
+			result[uid] = s
+		}
+	}
+	return result
 }
 
 // UpdateSecret applies the updates function to the secret and sets UpdatedAt.

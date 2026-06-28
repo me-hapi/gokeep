@@ -199,6 +199,7 @@ func init() {
 	secretEditCmd.Flags().String("notes", "", "Notes")
 	secretRemoveCmd.Flags().String("env", "", "Environment name")
 	secretListCmd.Flags().String("env", "", "Environment name")
+	secretListCmd.Flags().String("filter", "", "Filter secrets by name, URL, or notes")
 	secretRevealCmd.Flags().String("env", "", "Environment name")
 	secretShowCmd.Flags().String("env", "", "Environment name")
 }

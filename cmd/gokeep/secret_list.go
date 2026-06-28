@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -35,6 +36,19 @@ var secretListCmd = &cobra.Command{
 			secrets = v.ListSecretsByProject(projectUID)
 		default:
 			secrets = v.ListSecrets()
+		}
+		filter, _ := cmd.Flags().GetString("filter")
+		if filter != "" {
+			lower := strings.ToLower(filter)
+			filtered := make(map[string]vault.Secret)
+			for uid, s := range secrets {
+				if strings.Contains(strings.ToLower(s.Name), lower) ||
+					strings.Contains(strings.ToLower(s.URL), lower) ||
+					strings.Contains(strings.ToLower(s.Notes), lower) {
+					filtered[uid] = s
+				}
+			}
+			secrets = filtered
 		}
 		if len(secrets) == 0 {
 			fmt.Fprintln(cmd.OutOrStdout(), "No secrets.")
