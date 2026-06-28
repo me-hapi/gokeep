@@ -1813,7 +1813,7 @@ func TestSecretShowJSON(t *testing.T) {
 	}
 	pUID, _ := v.AddProject(vault.Project{Name: "myapp"})
 	eUID, _ := v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: pUID})
-	v.AddSecret(vault.Secret{
+	secretUID, _ := v.AddSecret(vault.Secret{
 		Name: "DB_PASS", Value: "s3cret", ProjectUID: pUID, EnvironmentUID: eUID,
 		URL: "https://db.example.com", Notes: "database",
 	})
@@ -1821,7 +1821,11 @@ func TestSecretShowJSON(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+	t.Cleanup(func() {
+		rootCmd.SetArgs(nil)
+		rootCmd.SetOut(nil)
+		rootCmd.SetErr(nil)
+	})
 
 	var buf bytes.Buffer
 	rootCmd.SetOut(&buf)
@@ -1851,8 +1855,10 @@ func TestSecretShowJSON(t *testing.T) {
 		t.Errorf("notes = %v", got["notes"])
 	}
 	uid, ok := got["uid"].(string)
-	if !ok || uid == "" {
-		t.Errorf("uid missing or empty: %v", got["uid"])
+	if !ok {
+		t.Errorf("uid missing or not a string: %v", got["uid"])
+	} else if uid != secretUID {
+		t.Errorf("uid = %q, want full uid %q", uid, secretUID)
 	}
 }
 
