@@ -65,25 +65,31 @@ var listCmd = &cobra.Command{
 							secKeys := sortedKeysByName(envSecrets, func(s vault.Secret) string { return s.Name })
 							for _, sUID := range secKeys {
 								s := envSecrets[sUID]
-								en.Secrets = append(en.Secrets, secretRef{Name: s.Name, UID: shortUID(sUID)})
+								en.Secrets = append(en.Secrets, secretRef{Name: s.Name, UID: sUID})
 							}
 							pn.Envs = append(pn.Envs, en)
 						}
 					}
 					projSecrets := v.ListSecretsByProject(pUID)
+					var projSecRefs []secretRef
 					for sUID, s := range projSecrets {
 						if s.EnvironmentUID == "" {
-							pn.Secrets = append(pn.Secrets, secretRef{Name: s.Name, UID: shortUID(sUID)})
+							projSecRefs = append(projSecRefs, secretRef{Name: s.Name, UID: sUID})
 						}
 					}
+					sort.Slice(projSecRefs, func(i, j int) bool { return projSecRefs[i].Name < projSecRefs[j].Name })
+					pn.Secrets = append(pn.Secrets, projSecRefs...)
 					out.Projects = append(out.Projects, pn)
 				}
 			}
+			var standaloneRefs []secretRef
 			for sUID, s := range secrets {
 				if s.ProjectUID == "" {
-					out.Standalone = append(out.Standalone, secretRef{Name: s.Name, UID: shortUID(sUID)})
+					standaloneRefs = append(standaloneRefs, secretRef{Name: s.Name, UID: sUID})
 				}
 			}
+			sort.Slice(standaloneRefs, func(i, j int) bool { return standaloneRefs[i].Name < standaloneRefs[j].Name })
+			out.Standalone = append(out.Standalone, standaloneRefs...)
 			return printJSON(cmd.OutOrStdout(), out)
 		}
 		if len(projects) == 0 && len(secrets) == 0 {
@@ -111,7 +117,9 @@ var listCmd = &cobra.Command{
 					}
 				}
 				projSecrets := v.ListSecretsByProject(pUID)
-				for sUID, s := range projSecrets {
+				secKeys := sortedKeysByName(projSecrets, func(s vault.Secret) string { return s.Name })
+				for _, sUID := range secKeys {
+					s := projSecrets[sUID]
 					if s.EnvironmentUID == "" {
 						fmt.Fprintf(cmd.OutOrStdout(), "    %s (UID: %s)\n", s.Name, shortUID(sUID))
 					}

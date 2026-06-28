@@ -66,7 +66,7 @@ var secretListCmd = &cobra.Command{
 			var items []secretItem
 			for _, uid := range keys {
 				s := secrets[uid]
-				item := secretItem{Name: s.Name, UID: shortUID(uid), URL: s.URL}
+				item := secretItem{Name: s.Name, UID: uid, URL: s.URL}
 				if s.ProjectUID != "" {
 					if p, ok := v.GetProject(s.ProjectUID); ok {
 						item.Project = p.Name
@@ -134,7 +134,7 @@ var secretRevealCmd = &cobra.Command{
 			}
 			detail := secretReveal{
 				Name:    s.Name,
-				UID:     shortUID(uid),
+				UID:     uid,
 				Value:   s.Value,
 				URL:     s.URL,
 				Notes:   s.Notes,
@@ -218,7 +218,7 @@ var secretShowCmd = &cobra.Command{
 			}
 			detail := secretDetail{
 				Name:    s.Name,
-				UID:     shortUID(uid),
+				UID:     uid,
 				URL:     s.URL,
 				Notes:   s.Notes,
 				Created: s.CreatedAt.Format("2006-01-02 15:04:05"),

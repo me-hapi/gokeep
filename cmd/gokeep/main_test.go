@@ -1798,3 +1798,137 @@ func TestListJSONEmpty(t *testing.T) {
 		t.Errorf("expected empty projects array, got %d", len(projects))
 	}
 }
+
+func TestSecretShowJSON(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pUID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	eUID, _ := v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: pUID})
+	v.AddSecret(vault.Secret{
+		Name: "DB_PASS", Value: "s3cret", ProjectUID: pUID, EnvironmentUID: eUID,
+		URL: "https://db.example.com", Notes: "database",
+	})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"secret", "show", "DB_PASS", "--project", "myapp", "--env", "prod", "--format", "json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("secret show: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if got["name"] != "DB_PASS" {
+		t.Errorf("name = %v, want DB_PASS", got["name"])
+	}
+	if got["project"] != "myapp" {
+		t.Errorf("project = %v, want myapp", got["project"])
+	}
+	if got["env"] != "prod" {
+		t.Errorf("env = %v, want prod", got["env"])
+	}
+	if got["url"] != "https://db.example.com" {
+		t.Errorf("url = %v", got["url"])
+	}
+	if got["notes"] != "database" {
+		t.Errorf("notes = %v", got["notes"])
+	}
+	uid, ok := got["uid"].(string)
+	if !ok || uid == "" {
+		t.Errorf("uid missing or empty: %v", got["uid"])
+	}
+}
+
+func TestListJSONPopulated(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pUID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	eUID1, _ := v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: pUID})
+	eUID2, _ := v.AddEnvironment(vault.Environment{Name: "dev", ProjectUID: pUID})
+	v.AddSecret(vault.Secret{Name: "SECRET_A", Value: "a", ProjectUID: pUID, EnvironmentUID: eUID1})
+	v.AddSecret(vault.Secret{Name: "SECRET_B", Value: "b", ProjectUID: pUID, EnvironmentUID: eUID2})
+	v.AddSecret(vault.Secret{Name: "STANDALONE_SECRET", Value: "c"})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"list", "--format", "json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	projects, ok := got["projects"].([]any)
+	if !ok {
+		t.Fatalf("projects field missing or wrong type: %v", got["projects"])
+	}
+	if len(projects) != 1 {
+		t.Fatalf("expected 1 project, got %d", len(projects))
+	}
+	p := projects[0].(map[string]any)
+	if p["name"] != "myapp" {
+		t.Errorf("project name = %v, want myapp", p["name"])
+	}
+	envs, ok := p["envs"].([]any)
+	if !ok {
+		t.Fatalf("envs field missing or wrong type: %v", p["envs"])
+	}
+	if len(envs) != 2 {
+		t.Fatalf("expected 2 envs, got %d", len(envs))
+	}
+	for _, e := range envs {
+		env := e.(map[string]any)
+		secrets, ok := env["secrets"].([]any)
+		if !ok {
+			t.Fatalf("secrets missing for env %v", env["name"])
+		}
+		if len(secrets) != 1 {
+			t.Errorf("expected 1 secret in env %v, got %d", env["name"], len(secrets))
+		}
+	}
+	standalone, ok := got["standalone"].([]any)
+	if !ok {
+		t.Fatalf("standalone field missing or wrong type: %v", got["standalone"])
+	}
+	if len(standalone) != 1 {
+		t.Fatalf("expected 1 standalone secret, got %d", len(standalone))
+	}
+	s := standalone[0].(map[string]any)
+	if s["name"] != "STANDALONE_SECRET" {
+		t.Errorf("standalone name = %v, want STANDALONE_SECRET", s["name"])
+	}
+}
