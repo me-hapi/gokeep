@@ -50,11 +50,41 @@ var secretListCmd = &cobra.Command{
 			}
 			secrets = filtered
 		}
+		keys := sortedKeysByName(secrets, func(s vault.Secret) string { return s.Name })
+		format, _ := cmd.Flags().GetString("format")
+		if format == "json" {
+			if len(secrets) == 0 {
+				return printJSON(cmd.OutOrStdout(), []any{})
+			}
+			type secretItem struct {
+				Name    string `json:"name"`
+				UID     string `json:"uid"`
+				URL     string `json:"url,omitempty"`
+				Project string `json:"project,omitempty"`
+				Env     string `json:"env,omitempty"`
+			}
+			var items []secretItem
+			for _, uid := range keys {
+				s := secrets[uid]
+				item := secretItem{Name: s.Name, UID: shortUID(uid), URL: s.URL}
+				if s.ProjectUID != "" {
+					if p, ok := v.GetProject(s.ProjectUID); ok {
+						item.Project = p.Name
+					}
+				}
+				if s.EnvironmentUID != "" {
+					if e, ok := v.GetEnvironment(s.EnvironmentUID); ok {
+						item.Env = e.Name
+					}
+				}
+				items = append(items, item)
+			}
+			return printJSON(cmd.OutOrStdout(), items)
+		}
 		if len(secrets) == 0 {
 			fmt.Fprintln(cmd.OutOrStdout(), "No secrets.")
 			return nil
 		}
-		keys := sortedKeysByName(secrets, func(s vault.Secret) string { return s.Name })
 		for _, uid := range keys {
 			s := secrets[uid]
 			fmt.Fprintf(cmd.OutOrStdout(), "  %-20s (UID: %s)\n", s.Name, shortUID(uid))
@@ -88,6 +118,40 @@ var secretRevealCmd = &cobra.Command{
 		}
 		if err := session.Touch(vaultDir); err != nil {
 			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: could not update session: %v\n", err)
+		}
+		format, _ := cmd.Flags().GetString("format")
+		if format == "json" {
+			type secretReveal struct {
+				Name    string `json:"name"`
+				UID     string `json:"uid"`
+				Value   string `json:"value"`
+				URL     string `json:"url,omitempty"`
+				Notes   string `json:"notes,omitempty"`
+				Project string `json:"project,omitempty"`
+				Env     string `json:"env,omitempty"`
+				Created string `json:"created"`
+				Updated string `json:"updated"`
+			}
+			detail := secretReveal{
+				Name:    s.Name,
+				UID:     shortUID(uid),
+				Value:   s.Value,
+				URL:     s.URL,
+				Notes:   s.Notes,
+				Created: s.CreatedAt.Format("2006-01-02 15:04:05"),
+				Updated: s.UpdatedAt.Format("2006-01-02 15:04:05"),
+			}
+			if s.ProjectUID != "" {
+				if p, ok := v.GetProject(s.ProjectUID); ok {
+					detail.Project = p.Name
+				}
+			}
+			if s.EnvironmentUID != "" {
+				if e, ok := v.GetEnvironment(s.EnvironmentUID); ok {
+					detail.Env = e.Name
+				}
+			}
+			return printJSON(cmd.OutOrStdout(), detail)
 		}
 		fmt.Fprintf(cmd.OutOrStdout(), "Name:    %s\n", s.Name)
 		fmt.Fprintf(cmd.OutOrStdout(), "UID:     %s\n", shortUID(uid))
@@ -139,6 +203,38 @@ var secretShowCmd = &cobra.Command{
 		}
 		if err := session.Touch(vaultDir); err != nil {
 			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: could not update session: %v\n", err)
+		}
+		format, _ := cmd.Flags().GetString("format")
+		if format == "json" {
+			type secretDetail struct {
+				Name    string `json:"name"`
+				UID     string `json:"uid"`
+				URL     string `json:"url,omitempty"`
+				Notes   string `json:"notes,omitempty"`
+				Project string `json:"project,omitempty"`
+				Env     string `json:"env,omitempty"`
+				Created string `json:"created"`
+				Updated string `json:"updated"`
+			}
+			detail := secretDetail{
+				Name:    s.Name,
+				UID:     shortUID(uid),
+				URL:     s.URL,
+				Notes:   s.Notes,
+				Created: s.CreatedAt.Format("2006-01-02 15:04:05"),
+				Updated: s.UpdatedAt.Format("2006-01-02 15:04:05"),
+			}
+			if s.ProjectUID != "" {
+				if p, ok := v.GetProject(s.ProjectUID); ok {
+					detail.Project = p.Name
+				}
+			}
+			if s.EnvironmentUID != "" {
+				if e, ok := v.GetEnvironment(s.EnvironmentUID); ok {
+					detail.Env = e.Name
+				}
+			}
+			return printJSON(cmd.OutOrStdout(), detail)
 		}
 		fmt.Fprintf(cmd.OutOrStdout(), "Name:    %s\n", s.Name)
 		fmt.Fprintf(cmd.OutOrStdout(), "UID:     %s\n", shortUID(uid))

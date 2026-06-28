@@ -45,11 +45,41 @@ var findCmd = &cobra.Command{
 			}
 			results = filtered
 		}
+		keys := sortedKeysByName(results, func(s vault.Secret) string { return s.Name })
+		format, _ := cmd.Flags().GetString("format")
+		if format == "json" {
+			if len(results) == 0 {
+				return printJSON(cmd.OutOrStdout(), []any{})
+			}
+			type findResult struct {
+				Name    string `json:"name"`
+				UID     string `json:"uid"`
+				URL     string `json:"url,omitempty"`
+				Project string `json:"project,omitempty"`
+				Env     string `json:"env,omitempty"`
+			}
+			var items []findResult
+			for _, uid := range keys {
+				s := results[uid]
+				item := findResult{Name: s.Name, UID: shortUID(uid), URL: s.URL}
+				if s.ProjectUID != "" {
+					if p, ok := v.GetProject(s.ProjectUID); ok {
+						item.Project = p.Name
+					}
+				}
+				if s.EnvironmentUID != "" {
+					if e, ok := v.GetEnvironment(s.EnvironmentUID); ok {
+						item.Env = e.Name
+					}
+				}
+				items = append(items, item)
+			}
+			return printJSON(cmd.OutOrStdout(), items)
+		}
 		if len(results) == 0 {
 			fmt.Fprintf(cmd.OutOrStdout(), "No secrets matching '%s'.\n", pattern)
 			return nil
 		}
-		keys := sortedKeysByName(results, func(s vault.Secret) string { return s.Name })
 		for _, uid := range keys {
 			s := results[uid]
 			line := fmt.Sprintf("  %-20s (UID: %s)", s.Name, shortUID(uid))
@@ -76,4 +106,5 @@ func init() {
 	rootCmd.AddCommand(findCmd)
 	findCmd.Flags().String("project", "", "Scope to project")
 	findCmd.Flags().String("env", "", "Scope to environment")
+	findCmd.Flags().StringP("format", "o", "", "Output format: json")
 }

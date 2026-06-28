@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -100,4 +101,14 @@ func confirmDeletion(w io.Writer, r io.Reader, name string) (bool, error) {
 	}
 	input = strings.TrimSpace(strings.ToLower(input))
 	return input == "yes" || input == "y", nil
+}
+
+// printJSON marshals v as indented JSON and writes it to w.
+func printJSON(w io.Writer, v any) error {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal json: %w", err)
+	}
+	_, err = fmt.Fprintln(w, string(data))
+	return err
 }
