@@ -1071,6 +1071,12 @@ func resetExportImportFlags() {
 	for _, name := range []string{"env", "format", "filter"} {
 		_ = secretListCmd.Flags().Set(name, "")
 	}
+	// Reset listCmd flags (project/env/format leak between tests)
+	for _, name := range []string{"project", "env", "format"} {
+		_ = listCmd.Flags().Set(name, "")
+	}
+	// Reset envCmd persistent flags (project leaks between tests)
+	_ = envCmd.PersistentFlags().Set("project", "")
 }
 
 func TestExportJSON(t *testing.T) {
@@ -1936,5 +1942,587 @@ func TestListJSONPopulated(t *testing.T) {
 	s := standalone[0].(map[string]any)
 	if s["name"] != "STANDALONE_SECRET" {
 		t.Errorf("standalone name = %v, want STANDALONE_SECRET", s["name"])
+	}
+}
+
+// --- project list/show JSON tests ---
+
+func TestProjectListJSONEmpty(t *testing.T) {
+	resetCmdFlags(t)
+	setupTestVault(t)
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"project", "list", "--format", "json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("project list: %v", err)
+	}
+	var items []any
+	if err := json.Unmarshal(buf.Bytes(), &items); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if len(items) != 0 {
+		t.Errorf("expected empty array, got %d items", len(items))
+	}
+}
+
+func TestProjectListJSONPopulated(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	v.AddProject(vault.Project{Name: "alpha", Description: "first", URL: "https://alpha.example.com"})
+	v.AddProject(vault.Project{Name: "beta", Description: "second"})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"project", "list", "--format", "json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("project list: %v", err)
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &items); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 projects, got %d", len(items))
+	}
+	// Sorted by name: alpha, beta
+	if items[0]["name"] != "alpha" {
+		t.Errorf("first project name = %v, want alpha", items[0]["name"])
+	}
+	if items[0]["description"] != "first" {
+		t.Errorf("alpha description = %v, want first", items[0]["description"])
+	}
+	if items[0]["url"] != "https://alpha.example.com" {
+		t.Errorf("alpha url = %v, want https://alpha.example.com", items[0]["url"])
+	}
+	if items[1]["name"] != "beta" {
+		t.Errorf("second project name = %v, want beta", items[1]["name"])
+	}
+	// UIDs should be full strings (not short)
+	uid, ok := items[0]["uid"].(string)
+	if !ok || len(uid) < 16 {
+		t.Errorf("uid should be a full string, got: %v", items[0]["uid"])
+	}
+}
+
+func TestProjectShowJSON(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pUID, _ := v.AddProject(vault.Project{Name: "myapp", Description: "app", URL: "https://app.example.com", Notes: "notes here"})
+	eUID, _ := v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: pUID})
+	v.AddSecret(vault.Secret{Name: "DB_PASS", Value: "s3cret", ProjectUID: pUID, EnvironmentUID: eUID})
+	v.AddSecret(vault.Secret{Name: "API_KEY", Value: "key123", ProjectUID: pUID})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"project", "show", "myapp", "--format", "json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("project show: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if got["name"] != "myapp" {
+		t.Errorf("name = %v, want myapp", got["name"])
+	}
+	if got["description"] != "app" {
+		t.Errorf("description = %v, want app", got["description"])
+	}
+	if got["url"] != "https://app.example.com" {
+		t.Errorf("url = %v, want https://app.example.com", got["url"])
+	}
+	if got["notes"] != "notes here" {
+		t.Errorf("notes = %v, want notes here", got["notes"])
+	}
+	if got["created"] == nil || got["created"] == "" {
+		t.Error("created should not be empty")
+	}
+	if got["updated"] == nil || got["updated"] == "" {
+		t.Error("updated should not be empty")
+	}
+	envs, ok := got["environments"].([]any)
+	if !ok {
+		t.Fatalf("environments missing or wrong type: %v", got["environments"])
+	}
+	if len(envs) != 1 {
+		t.Errorf("expected 1 environment, got %d", len(envs))
+	}
+	env := envs[0].(map[string]any)
+	if env["name"] != "prod" {
+		t.Errorf("env name = %v, want prod", env["name"])
+	}
+	if got["secret_count"] != float64(2) {
+		t.Errorf("secret_count = %v, want 2", got["secret_count"])
+	}
+}
+
+func TestProjectShowJSONNotFound(t *testing.T) {
+	resetCmdFlags(t)
+	setupTestVault(t)
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	rootCmd.SetArgs([]string{"project", "show", "nonexistent", "--format", "json"})
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for nonexistent project")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error should mention 'not found', got: %v", err)
+	}
+}
+
+// --- env list/show JSON tests ---
+
+func TestEnvListJSONEmpty(t *testing.T) {
+	resetCmdFlags(t)
+	setupTestVault(t)
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"env", "list", "--format", "json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("env list: %v", err)
+	}
+	var items []any
+	if err := json.Unmarshal(buf.Bytes(), &items); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if len(items) != 0 {
+		t.Errorf("expected empty array, got %d items", len(items))
+	}
+}
+
+func TestEnvListJSONPopulated(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	p1UID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	p2UID, _ := v.AddProject(vault.Project{Name: "other"})
+	v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: p1UID})
+	v.AddEnvironment(vault.Environment{Name: "dev", ProjectUID: p1UID})
+	v.AddEnvironment(vault.Environment{Name: "staging", ProjectUID: p2UID})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"env", "list", "--format", "json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("env list: %v", err)
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &items); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if len(items) != 3 {
+		t.Fatalf("expected 3 envs, got %d", len(items))
+	}
+	// Each env should have name, uid, and project
+	for _, item := range items {
+		if item["name"] == nil || item["name"] == "" {
+			t.Errorf("env missing name: %v", item)
+		}
+		if item["uid"] == nil || item["uid"] == "" {
+			t.Errorf("env missing uid: %v", item)
+		}
+		if item["project"] == nil || item["project"] == "" {
+			t.Errorf("env missing project: %v", item)
+		}
+	}
+}
+
+func TestEnvListJSONScoped(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	p1UID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	p2UID, _ := v.AddProject(vault.Project{Name: "other"})
+	v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: p1UID})
+	v.AddEnvironment(vault.Environment{Name: "dev", ProjectUID: p1UID})
+	v.AddEnvironment(vault.Environment{Name: "staging", ProjectUID: p2UID})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"env", "list", "--project", "myapp", "--format", "json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("env list: %v", err)
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &items); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 envs in myapp, got %d", len(items))
+	}
+	for _, item := range items {
+		if item["project"] != "myapp" {
+			t.Errorf("env project = %v, want myapp", item["project"])
+		}
+	}
+}
+
+func TestEnvListJSONProjectNotFound(t *testing.T) {
+	resetCmdFlags(t)
+	setupTestVault(t)
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"env", "list", "--project", "nonexistent", "--format", "json"})
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for nonexistent project")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error should mention 'not found', got: %v", err)
+	}
+}
+
+func TestEnvShowJSON(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pUID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	eUID, _ := v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: pUID, Description: "production", Notes: "be careful"})
+	v.AddSecret(vault.Secret{Name: "DB_PASS", Value: "s3cret", ProjectUID: pUID, EnvironmentUID: eUID})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"env", "show", "prod", "--project", "myapp", "--format", "json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("env show: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if got["name"] != "prod" {
+		t.Errorf("name = %v, want prod", got["name"])
+	}
+	if got["project"] != "myapp" {
+		t.Errorf("project = %v, want myapp", got["project"])
+	}
+	if got["description"] != "production" {
+		t.Errorf("description = %v, want production", got["description"])
+	}
+	if got["notes"] != "be careful" {
+		t.Errorf("notes = %v, want be careful", got["notes"])
+	}
+	if got["created"] == nil || got["created"] == "" {
+		t.Error("created should not be empty")
+	}
+	secrets, ok := got["secrets"].([]any)
+	if !ok {
+		t.Fatalf("secrets missing or wrong type: %v", got["secrets"])
+	}
+	if len(secrets) != 1 {
+		t.Errorf("expected 1 secret, got %d", len(secrets))
+	}
+}
+
+// --- list command scope filtering tests ---
+
+func TestListJSONScopedByProject(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	p1UID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	p2UID, _ := v.AddProject(vault.Project{Name: "other"})
+	eUID1, _ := v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: p1UID})
+	v.AddEnvironment(vault.Environment{Name: "staging", ProjectUID: p2UID})
+	v.AddSecret(vault.Secret{Name: "SECRET_A", Value: "a", ProjectUID: p1UID, EnvironmentUID: eUID1})
+	v.AddSecret(vault.Secret{Name: "SECRET_B", Value: "b", ProjectUID: p2UID})
+	v.AddSecret(vault.Secret{Name: "STANDALONE", Value: "s"})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"list", "--project", "myapp", "--format", "json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	projects, ok := got["projects"].([]any)
+	if !ok {
+		t.Fatalf("projects missing: %v", got)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("expected 1 project, got %d", len(projects))
+	}
+	p := projects[0].(map[string]any)
+	if p["name"] != "myapp" {
+		t.Errorf("project name = %v, want myapp", p["name"])
+	}
+	// Standalone should not appear when scoped to a project
+	if _, ok := got["standalone"]; ok {
+		t.Error("standalone should not appear when scoped to a project")
+	}
+}
+
+func TestListJSONScopedByProjectAndEnv(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pUID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	prodUID, _ := v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: pUID})
+	devUID, _ := v.AddEnvironment(vault.Environment{Name: "dev", ProjectUID: pUID})
+	v.AddSecret(vault.Secret{Name: "PROD_SECRET", Value: "p", ProjectUID: pUID, EnvironmentUID: prodUID})
+	v.AddSecret(vault.Secret{Name: "DEV_SECRET", Value: "d", ProjectUID: pUID, EnvironmentUID: devUID})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"list", "--project", "myapp", "--env", "prod", "--format", "json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	projects := got["projects"].([]any)
+	if len(projects) != 1 {
+		t.Fatalf("expected 1 project, got %d", len(projects))
+	}
+	p := projects[0].(map[string]any)
+	envs, ok := p["envs"].([]any)
+	if !ok {
+		t.Fatalf("envs missing: %v", p)
+	}
+	if len(envs) != 1 {
+		t.Fatalf("expected 1 env, got %d", len(envs))
+	}
+	env := envs[0].(map[string]any)
+	if env["name"] != "prod" {
+		t.Errorf("env name = %v, want prod", env["name"])
+	}
+	secrets := env["secrets"].([]any)
+	if len(secrets) != 1 {
+		t.Fatalf("expected 1 secret in prod, got %d", len(secrets))
+	}
+	sec := secrets[0].(map[string]any)
+	if sec["name"] != "PROD_SECRET" {
+		t.Errorf("secret name = %v, want PROD_SECRET", sec["name"])
+	}
+}
+
+func TestListEnvRequiresProject(t *testing.T) {
+	resetCmdFlags(t)
+	setupTestVault(t)
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	rootCmd.SetArgs([]string{"list", "--env", "prod"})
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for --env without --project")
+	}
+	if !strings.Contains(err.Error(), "--env requires --project") {
+		t.Errorf("error should mention '--env requires --project', got: %v", err)
+	}
+}
+
+func TestEnvListWithoutProjectFlag(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	p1UID, _ := v.AddProject(vault.Project{Name: "app1"})
+	p2UID, _ := v.AddProject(vault.Project{Name: "app2"})
+	v.AddEnvironment(vault.Environment{Name: "dev", ProjectUID: p1UID})
+	v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: p2UID})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"env", "list", "--format", "json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("env list: %v", err)
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &items); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 envs across all projects, got %d", len(items))
+	}
+}
+
+func TestListJSONPopulatedProjectScopes(t *testing.T) {
+	resetCmdFlags(t)
+	dir := setupTestVault(t)
+	salt, err := vault.GetSalt(dir)
+	if err != nil {
+		t.Fatalf("GetSalt: %v", err)
+	}
+	key := crypto.DeriveKey("password1234", salt)
+	v, err := vault.Open(dir, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pUID, _ := v.AddProject(vault.Project{Name: "myapp"})
+	eUID, _ := v.AddEnvironment(vault.Environment{Name: "prod", ProjectUID: pUID})
+	v.AddSecret(vault.Secret{Name: "SECRET_A", Value: "a", ProjectUID: pUID, EnvironmentUID: eUID})
+	v.AddSecret(vault.Secret{Name: "STANDALONE", Value: "s"})
+	if err := v.Save(dir, key); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	// Without scope: should show standalone
+	var buf bytes.Buffer
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(io.Discard)
+	rootCmd.SetArgs([]string{"list", "--format", "json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	standalone, ok := got["standalone"].([]any)
+	if !ok {
+		t.Fatalf("standalone missing: %v", got)
+	}
+	if len(standalone) != 1 {
+		t.Errorf("expected 1 standalone, got %d", len(standalone))
+	}
+
+	// With --project scope: standalone should NOT appear
+	buf.Reset()
+	rootCmd.SetOut(&buf)
+	rootCmd.SetArgs([]string{"list", "--project", "myapp", "--format", "json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("list scoped: %v", err)
+	}
+	var got2 map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got2); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if _, ok := got2["standalone"]; ok {
+		t.Error("standalone should not appear when scoped to a project")
 	}
 }

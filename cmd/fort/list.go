@@ -18,12 +18,21 @@ var listCmd = &cobra.Command{
 		if vaultDir == "" {
 			return errors.New("cannot determine home directory")
 		}
+		projectName, _ := cmd.Flags().GetString("project")
+		envName, _ := cmd.Flags().GetString("env")
+		if envName != "" && projectName == "" {
+			return errors.New("--env requires --project")
+		}
 		v, _, err := openVault(vaultDir, cmd.ErrOrStderr(), cmd.ErrOrStderr())
 		if err != nil {
 			return err
 		}
 		if err := session.Touch(vaultDir); err != nil {
 			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: could not update session: %v\n", err)
+		}
+		projectUID, envUID, err := resolveScope(v, projectName, envName)
+		if err != nil {
+			return err
 		}
 		projects := v.ListProjects()
 		secrets := v.ListSecrets()
@@ -50,46 +59,61 @@ var listCmd = &cobra.Command{
 				Projects:   make([]projectNode, 0),
 				Standalone: make([]secretRef, 0),
 			}
-			if len(projects) > 0 {
-				projectKeys := sortedKeysByName(projects, func(p vault.Project) string { return p.Name })
-				for _, pUID := range projectKeys {
-					p := projects[pUID]
-					pn := projectNode{Name: p.Name}
-					envs := v.ListEnvironmentsByProject(pUID)
-					if len(envs) > 0 {
-						envKeys := sortedKeysByName(envs, func(e vault.Environment) string { return e.Name })
-						for _, eUID := range envKeys {
-							e := envs[eUID]
-							en := envNode{Name: e.Name}
-							envSecrets := v.ListSecretsByProjectAndEnvironment(pUID, eUID)
-							secKeys := sortedKeysByName(envSecrets, func(s vault.Secret) string { return s.Name })
-							for _, sUID := range secKeys {
-								s := envSecrets[sUID]
-								en.Secrets = append(en.Secrets, secretRef{Name: s.Name, UID: sUID})
-							}
-							pn.Envs = append(pn.Envs, en)
-						}
-					}
-					projSecrets := v.ListSecretsByProject(pUID)
-					var projSecRefs []secretRef
-					for sUID, s := range projSecrets {
-						if s.EnvironmentUID == "" {
-							projSecRefs = append(projSecRefs, secretRef{Name: s.Name, UID: sUID})
-						}
-					}
-					sort.Slice(projSecRefs, func(i, j int) bool { return projSecRefs[i].Name < projSecRefs[j].Name })
-					pn.Secrets = append(pn.Secrets, projSecRefs...)
-					out.Projects = append(out.Projects, pn)
+			projectKeys := sortedKeysByName(projects, func(p vault.Project) string { return p.Name })
+			// scope: if projectUID set, only include that project
+			if projectUID != "" {
+				if _, ok := projects[projectUID]; ok {
+					projectKeys = []string{projectUID}
+				} else {
+					projectKeys = nil
 				}
 			}
-			var standaloneRefs []secretRef
-			for sUID, s := range secrets {
-				if s.ProjectUID == "" {
-					standaloneRefs = append(standaloneRefs, secretRef{Name: s.Name, UID: sUID})
+			for _, pUID := range projectKeys {
+				p := projects[pUID]
+				pn := projectNode{Name: p.Name}
+				envs := v.ListEnvironmentsByProject(pUID)
+				envKeys := sortedKeysByName(envs, func(e vault.Environment) string { return e.Name })
+				// scope: if envUID set, only include that env
+				if envUID != "" && projectUID != "" {
+					if _, ok := envs[envUID]; ok {
+						envKeys = []string{envUID}
+					} else {
+						envKeys = nil
+					}
 				}
+				for _, eUID := range envKeys {
+					e := envs[eUID]
+					en := envNode{Name: e.Name}
+					envSecrets := v.ListSecretsByProjectAndEnvironment(pUID, eUID)
+					secKeys := sortedKeysByName(envSecrets, func(s vault.Secret) string { return s.Name })
+					for _, sUID := range secKeys {
+						s := envSecrets[sUID]
+						en.Secrets = append(en.Secrets, secretRef{Name: s.Name, UID: sUID})
+					}
+					pn.Envs = append(pn.Envs, en)
+				}
+				projSecrets := v.ListSecretsByProject(pUID)
+				var projSecRefs []secretRef
+				for sUID, s := range projSecrets {
+					if s.EnvironmentUID == "" {
+						projSecRefs = append(projSecRefs, secretRef{Name: s.Name, UID: sUID})
+					}
+				}
+				sort.Slice(projSecRefs, func(i, j int) bool { return projSecRefs[i].Name < projSecRefs[j].Name })
+				pn.Secrets = append(pn.Secrets, projSecRefs...)
+				out.Projects = append(out.Projects, pn)
 			}
-			sort.Slice(standaloneRefs, func(i, j int) bool { return standaloneRefs[i].Name < standaloneRefs[j].Name })
-			out.Standalone = append(out.Standalone, standaloneRefs...)
+			// only include standalone when no scope filter
+			if projectUID == "" {
+				var standaloneRefs []secretRef
+				for sUID, s := range secrets {
+					if s.ProjectUID == "" {
+						standaloneRefs = append(standaloneRefs, secretRef{Name: s.Name, UID: sUID})
+					}
+				}
+				sort.Slice(standaloneRefs, func(i, j int) bool { return standaloneRefs[i].Name < standaloneRefs[j].Name })
+				out.Standalone = append(out.Standalone, standaloneRefs...)
+			}
 			return printJSON(cmd.OutOrStdout(), out)
 		}
 		if len(projects) == 0 && len(secrets) == 0 {
@@ -99,12 +123,26 @@ var listCmd = &cobra.Command{
 		if len(projects) > 0 {
 			fmt.Fprintln(cmd.OutOrStdout(), "Projects:")
 			projectKeys := sortedKeysByName(projects, func(p vault.Project) string { return p.Name })
+			if projectUID != "" {
+				if _, ok := projects[projectUID]; ok {
+					projectKeys = []string{projectUID}
+				} else {
+					projectKeys = nil
+				}
+			}
 			for _, pUID := range projectKeys {
 				p := projects[pUID]
 				fmt.Fprintf(cmd.OutOrStdout(), "  %s\n", p.Name)
 				envs := v.ListEnvironmentsByProject(pUID)
 				if len(envs) > 0 {
 					envKeys := sortedKeysByName(envs, func(e vault.Environment) string { return e.Name })
+					if envUID != "" && projectUID != "" {
+						if _, ok := envs[envUID]; ok {
+							envKeys = []string{envUID}
+						} else {
+							envKeys = nil
+						}
+					}
 					for _, eUID := range envKeys {
 						e := envs[eUID]
 						fmt.Fprintf(cmd.OutOrStdout(), "    %s\n", e.Name)
@@ -126,20 +164,23 @@ var listCmd = &cobra.Command{
 				}
 			}
 		}
-		var standalone []secretEntry
-		for sUID, s := range secrets {
-			if s.ProjectUID == "" {
-				standalone = append(standalone, secretEntry{name: s.Name, uid: sUID})
+		// only show standalone when no scope filter
+		if projectUID == "" {
+			var standalone []secretEntry
+			for sUID, s := range secrets {
+				if s.ProjectUID == "" {
+					standalone = append(standalone, secretEntry{name: s.Name, uid: sUID})
+				}
 			}
-		}
-		if len(standalone) > 0 {
-			if len(projects) > 0 {
-				fmt.Fprintln(cmd.OutOrStdout())
-			}
-			fmt.Fprintln(cmd.OutOrStdout(), "Standalone secrets:")
-			sort.Slice(standalone, func(i, j int) bool { return standalone[i].name < standalone[j].name })
-			for _, se := range standalone {
-				fmt.Fprintf(cmd.OutOrStdout(), "  %s (UID: %s)\n", se.name, shortUID(se.uid))
+			if len(standalone) > 0 {
+				if len(projects) > 0 {
+					fmt.Fprintln(cmd.OutOrStdout())
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), "Standalone secrets:")
+				sort.Slice(standalone, func(i, j int) bool { return standalone[i].name < standalone[j].name })
+				for _, se := range standalone {
+					fmt.Fprintf(cmd.OutOrStdout(), "  %s (UID: %s)\n", se.name, shortUID(se.uid))
+				}
 			}
 		}
 		return nil
@@ -154,4 +195,6 @@ type secretEntry struct {
 func init() {
 	rootCmd.AddCommand(listCmd)
 	listCmd.Flags().StringP("format", "o", "", "Output format: json")
+	listCmd.Flags().String("project", "", "Filter by project name")
+	listCmd.Flags().String("env", "", "Filter by environment name (requires --project)")
 }

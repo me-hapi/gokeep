@@ -146,11 +146,29 @@ var projectListCmd = &cobra.Command{
 			return err
 		}
 		projects := v.ListProjects()
+		keys := sortedKeysByName(projects, func(p vault.Project) string { return p.Name })
+		format, _ := cmd.Flags().GetString("format")
+		if format == "json" {
+			if len(projects) == 0 {
+				return printJSON(cmd.OutOrStdout(), []any{})
+			}
+			type projectItem struct {
+				Name        string `json:"name"`
+				UID         string `json:"uid"`
+				Description string `json:"description,omitempty"`
+				URL         string `json:"url,omitempty"`
+			}
+			var items []projectItem
+			for _, uid := range keys {
+				p := projects[uid]
+				items = append(items, projectItem{Name: p.Name, UID: uid, Description: p.Description, URL: p.URL})
+			}
+			return printJSON(cmd.OutOrStdout(), items)
+		}
 		if len(projects) == 0 {
 			fmt.Fprintln(cmd.OutOrStdout(), "No projects.")
 			return nil
 		}
-		keys := sortedKeysByName(projects, func(p vault.Project) string { return p.Name })
 		for _, uid := range keys {
 			p := projects[uid]
 			fmt.Fprintf(cmd.OutOrStdout(), "  %-20s (UID: %s)\n", p.Name, shortUID(uid))
@@ -175,6 +193,41 @@ var projectShowCmd = &cobra.Command{
 		p, uid, found := findProjectByName(v, name)
 		if !found {
 			return fmt.Errorf("project '%s' not found", name)
+		}
+		format, _ := cmd.Flags().GetString("format")
+		if format == "json" {
+			type envRef struct {
+				Name string `json:"name"`
+				UID  string `json:"uid"`
+			}
+			type projectDetail struct {
+				Name         string   `json:"name"`
+				UID          string   `json:"uid"`
+				Description  string   `json:"description,omitempty"`
+				URL          string   `json:"url,omitempty"`
+				Notes        string   `json:"notes,omitempty"`
+				Created      string   `json:"created"`
+				Updated      string   `json:"updated"`
+				Environments []envRef `json:"environments"`
+				SecretCount  int      `json:"secret_count"`
+			}
+			detail := projectDetail{
+				Name:        p.Name,
+				UID:         uid,
+				Description: p.Description,
+				URL:         p.URL,
+				Notes:       p.Notes,
+				Created:     p.CreatedAt.Format("2006-01-02 15:04:05"),
+				Updated:     p.UpdatedAt.Format("2006-01-02 15:04:05"),
+			}
+			envs := v.ListEnvironmentsByProject(uid)
+			envKeys := sortedKeysByName(envs, func(e vault.Environment) string { return e.Name })
+			for _, eUID := range envKeys {
+				e := envs[eUID]
+				detail.Environments = append(detail.Environments, envRef{Name: e.Name, UID: eUID})
+			}
+			detail.SecretCount = len(v.ListSecretsByProject(uid))
+			return printJSON(cmd.OutOrStdout(), detail)
 		}
 		fmt.Fprintf(cmd.OutOrStdout(), "Name:        %s\n", p.Name)
 		fmt.Fprintf(cmd.OutOrStdout(), "UID:         %s\n", shortUID(uid))
@@ -214,4 +267,6 @@ func init() {
 	projectEditCmd.Flags().String("desc", "", "Description")
 	projectEditCmd.Flags().String("url", "", "URL")
 	projectEditCmd.Flags().String("notes", "", "Notes")
+	projectListCmd.Flags().StringP("format", "o", "", "Output format: json")
+	projectShowCmd.Flags().StringP("format", "o", "", "Output format: json")
 }
