@@ -1,20 +1,20 @@
 .PHONY: all build run test test-race cover fmt vet lint sec vuln tidy ci clean
 
 GO ?= go
-BINARY := gokeep
+BINARY := fort
 PKG := ./...
 COVERAGE_FILE := coverage.out
 
 # Default target. Builds the binary.
 all: build
 
-# Build the gokeep binary. -trimpath strips local paths for reproducible builds.
+# Build the fort binary. -trimpath strips local paths for reproducible builds.
 build:
-	CGO_ENABLED=0 GOFLAGS=-trimpath $(GO) build -o $(BINARY) ./cmd/gokeep
+	CGO_ENABLED=0 GOFLAGS=-trimpath $(GO) build -o $(BINARY) ./cmd/fort
 
 # Run the CLI from source.
 run:
-	$(GO) run ./cmd/gokeep
+	$(GO) run ./cmd/fort
 
 # Run all tests. -count=1 disables test result caching.
 test:

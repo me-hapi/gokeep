@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/youruser/gokeep/internal/crypto"
+	"github.com/youruser/fortbyte/internal/crypto"
 )
 
 func testSalt(t *testing.T) []byte {

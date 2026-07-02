@@ -12,13 +12,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/youruser/gokeep/internal/crypto"
+	"github.com/youruser/fortbyte/internal/crypto"
 )
 
 // Sentinel errors
 var (
 	ErrVaultExists         = errors.New("vault already exists")
-	ErrVaultNotFound       = errors.New("vault not found: run 'gokeep init' first")
+	ErrVaultNotFound       = errors.New("vault not found: run 'fort init' first")
 	ErrSecretNotFound      = errors.New("secret not found")
 	ErrProjectNotFound     = errors.New("project not found")
 	ErrEnvironmentNotFound = errors.New("environment not found")

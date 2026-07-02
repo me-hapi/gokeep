@@ -17,7 +17,7 @@ var (
 )
 
 const (
-	keyringService = "gokeep"
+	keyringService = "fort"
 	keyringAccount = "master-password" // Store password, not derived key
 	sessionFile    = "session"
 	SessionMaxAge  = 24 * time.Hour

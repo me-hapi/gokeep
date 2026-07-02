@@ -1,4 +1,4 @@
-module github.com/youruser/gokeep
+module github.com/youruser/fortbyte
 
 go 1.22
 

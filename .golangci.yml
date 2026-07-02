@@ -1,4 +1,4 @@
-# golangci-lint configuration for gokeep
+# golangci-lint configuration for fortbyte
 # Docs: https://golangci-lint.run/
 # Linter list: https://golangci-lint.run/usage/linters/
 
@@ -63,7 +63,7 @@ linters-settings:
     excludes:
       - G107  # URL strings — too noisy for a CLI
   goimports:
-    local-prefixes: github.com/youruser/gokeep
+    local-prefixes: github.com/youruser/fortbyte
   varnamelen:
     min-name-length: 1
     ignore-names:
